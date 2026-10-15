@@ -1,58 +1,39 @@
-# ============================================================
-# FISCAL & REGIONAL DEVELOPMENT ANALYTICS DASHBOARD
-# Dataset: DATAAKSI - dataset_fiskal_97_hipoFull.csv
-# Main file: dsh-kota.py (or app.py)
-# ============================================================
-
-import io
-import warnings
+import re
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 import statsmodels.api as sm
-
-from statsmodels.stats.diagnostic import het_breuschpagan, het_white
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.stattools import jarque_bera, durbin_watson
 
-warnings.filterwarnings("ignore")
-
 # ============================================================
-# 1. PAGE CONFIGURATION
+# KONFIGURASI
 # ============================================================
-
 st.set_page_config(
-    page_title="Fiscal Analytics | DATAAKSI",
+    page_title="Fiscal & Regional Development Analytics",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 DATA_URL = (
-    "https://raw.githubusercontent.com/"
-    "Alam-A99/DATAAKSI/refs/heads/main/"
-    "dataset_fiskal_97_hipoFull.csv"
+    "https://raw.githubusercontent.com/Alam-A99/DATAAKSI/"
+    "refs/heads/main/dataset_fiskal_97_hipoFull.csv"
 )
-
-# ============================================================
-# 2. CUSTOM CSS
-# ============================================================
 
 st.markdown(
     """
     <style>
-    .stApp { background-color: #F5F7FB; }
-    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
-    h1, h2, h3 { color: #17365D; }
-    [data-testid="stMetric"] {
-        background: white; border: 1px solid #E2E8F0;
-        padding: 18px; border-radius: 12px;
-    }
-    [data-testid="stSidebar"] { background-color: #EAF0F8; }
-    div[data-testid="stPlotlyChart"] {
-        background-color: white; border-radius: 10px;
+    .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+    div[data-testid="stMetric"] {
+        background: rgba(120, 120, 120, 0.08);
+        border: 1px solid rgba(120, 120, 120, 0.18);
+        padding: 14px 16px;
+        border-radius: 12px;
     }
     </style>
     """,
@@ -60,793 +41,367 @@ st.markdown(
 )
 
 # ============================================================
-# 3. LOAD DATA
+# FUNGSI DATA
 # ============================================================
+@st.cache_data(ttl=3600, show_spinner="Mengambil dataset dari GitHub...")
+def load_data(url: str) -> pd.DataFrame:
+    df = pd.read_csv(url)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-@st.cache_data(ttl=3600, show_spinner="Memuat dataset fiskal...")
-def load_data_from_url(url: str) -> pd.DataFrame:
-    data = pd.read_csv(url)
-    return clean_data(data)
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
-def clean_data(data: pd.DataFrame) -> pd.DataFrame:
-    data = data.copy()
-    data.columns = [
-        str(col).strip().replace("\ufeff", "")
-        for col in data.columns
-    ]
+def find_column(columns, candidates):
+    """Cari kolom dengan pencocokan nama persis/parsial secara toleran."""
+    normalized = {normalize_name(c): c for c in columns}
+    for candidate in candidates:
+        key = normalize_name(candidate)
+        if key in normalized:
+            return normalized[key]
+    for candidate in candidates:
+        key = normalize_name(candidate)
+        if len(key) >= 3:
+            for norm, original in normalized.items():
+                if key in norm or norm in key:
+                    return original
+    return None
 
-    for col in data.select_dtypes(include=["object", "string"]).columns:
-        data[col] = data[col].apply(
-            lambda value: value.strip() if isinstance(value, str) else value
-        )
 
-    # Convert numeric-looking columns, preserving category columns.
-    for col in data.columns:
-        if col.upper() not in {"KOTA", "TAHUN"}:
-            converted = pd.to_numeric(data[col], errors="coerce")
-            if converted.notna().any():
-                data[col] = converted
+def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Konversi kolom numerik berbasis isi; jangan mengubah kolom kategori.
+    for col in df.columns:
+        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
+            cleaned = (
+                df[col].astype(str).str.strip()
+                .str.replace(",", "", regex=False)
+                .str.replace("%", "", regex=False)
+            )
+            converted = pd.to_numeric(cleaned, errors="coerce")
+            non_empty = df[col].notna().sum()
+            if non_empty > 0 and converted.notna().sum() / non_empty >= 0.85:
+                df[col] = converted
+    return df
 
-    # Normalize identity column names if capitalization differs.
-    rename_map = {}
-    for col in data.columns:
-        if col.lower() == "kota":
-            rename_map[col] = "Kota"
-        elif col.lower() == "tahun":
-            rename_map[col] = "Tahun"
-    data = data.rename(columns=rename_map)
 
-    if "Tahun" in data.columns:
-        data["Tahun"] = pd.to_numeric(data["Tahun"], errors="coerce")
+def to_excel_bytes(df: pd.DataFrame):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+    return buffer.getvalue()
 
-    return data
 
+# ============================================================
+# SIDEBAR + LOAD
+# ============================================================
+st.title("📊 Fiscal & Regional Development Analytics")
+st.caption("Dashboard eksplorasi data fiskal dan pembangunan daerah")
+with st.sidebar:
+    st.header("Pengaturan")
+    st.write("Sumber data: GitHub CSV")
+    if st.button("🔄 Muat ulang dataset", use_container_width=True):
+        load_data.clear()
+        st.rerun()
 
 try:
-    df = load_data_from_url(DATA_URL)
-except Exception as load_error:
-    st.error(f"Gagal memuat dataset dari URL: {load_error}")
-    uploaded = st.sidebar.file_uploader(
-        "Unggah dataset CSV sebagai alternatif",
-        type=["csv"],
-        key="fallback_csv",
-    )
-    if uploaded is None:
-        st.info(
-            "Periksa koneksi internet, URL dataset, dan status repository. "
-            "Anda juga dapat mengunggah file CSV melalui sidebar."
+    raw_df = load_data(DATA_URL)
+    df = prepare_data(raw_df)
+except Exception as e:
+    st.error("Dataset gagal dibaca. Pastikan URL GitHub bersifat publik dan file CSV dapat diakses.")
+    st.exception(e)
+    st.stop()
+
+if df.empty:
+    st.warning("Dataset berhasil dibaca, tetapi tidak memiliki baris data.")
+    st.stop()
+
+# Deteksi kolom identitas umum
+region_col = find_column(
+    df.columns,
+    ["Kota", "Kabupaten/Kota", "Kabupaten_Kota", "Nama Daerah", "Daerah", "Wilayah", "Kabupaten", "city", "region"]
+)
+year_col = find_column(df.columns, ["Tahun", "Year", "TA", "Periode"])
+
+# Filter interaktif
+with st.sidebar:
+    st.subheader("Filter data")
+    filtered = df.copy()
+
+    if region_col:
+        regions = sorted(filtered[region_col].dropna().astype(str).unique().tolist())
+        selected_regions = st.multiselect(
+            f"Pilih {region_col}",
+            regions,
+            default=regions[:min(5, len(regions))],
         )
-        st.stop()
-    try:
-        df = clean_data(pd.read_csv(uploaded))
-    except Exception as upload_error:
-        st.error(f"File CSV tidak dapat dibaca: {upload_error}")
-        st.stop()
+        if selected_regions:
+            filtered = filtered[filtered[region_col].astype(str).isin(selected_regions)]
+        else:
+            filtered = filtered.iloc[0:0]
 
-# ============================================================
-# 4. DATA PREPARATION
-# ============================================================
+    if year_col:
+        years_numeric = pd.to_numeric(filtered[year_col], errors="coerce")
+        unique_years = sorted(years_numeric.dropna().unique().tolist())
+        if unique_years:
+            year_range = st.slider(
+                f"Rentang {year_col}",
+                min_value=int(min(unique_years)),
+                max_value=int(max(unique_years)),
+                value=(int(min(unique_years)), int(max(unique_years))),
+            )
+            filtered = filtered[
+                pd.to_numeric(filtered[year_col], errors="coerce").between(year_range[0], year_range[1])
+            ]
 
-required_cols = {"Kota", "Tahun"}
-missing_required = required_cols.difference(df.columns)
-if missing_required:
-    st.error(
-        "Dataset harus memiliki kolom identitas Kota dan Tahun. "
-        f"Kolom yang belum ditemukan: {', '.join(sorted(missing_required))}"
-    )
-    st.stop()
+numeric_cols = filtered.select_dtypes(include=np.number).columns.tolist()
+categorical_cols = filtered.select_dtypes(exclude=np.number).columns.tolist()
 
-df["Kota"] = df["Kota"].astype("string").str.strip()
-df["Tahun"] = pd.to_numeric(df["Tahun"], errors="coerce")
-df = df.dropna(subset=["Kota", "Tahun"]).copy()
-df["Tahun"] = df["Tahun"].astype(int)
-
-numeric_cols = [
-    col for col in df.select_dtypes(include=np.number).columns
-    if col != "Tahun"
-]
-if not numeric_cols:
-    st.error("Tidak ditemukan variabel numerik untuk dianalisis.")
-    st.stop()
-
-fiscal_keywords = [
-    "PAD", "DBH", "DAU", "DAK", "TRANSFER", "PENDAPATAN",
-    "FISKAL", "PAJAK", "PNBP",
-]
-spending_keywords = [
-    "BM_", "BELANJA", "PENDIDIKAN", "KESEHATAN", "PERUMAHAN",
-    "LINGKUNGAN", "EKONOMI", "INFRASTRUKTUR", "PARIWISATA",
-    "PERLINDUNGAN_SOSIAL",
-]
-social_keywords = [
-    "IPM", "KEMISKINAN", "PENGANGGURAN", "KETIMPANGAN",
-    "GINI", "PENDIDIKAN", "KESEHATAN",
-]
-
-fiscal_cols = [
-    col for col in numeric_cols
-    if any(key in col.upper() for key in fiscal_keywords)
-]
-spending_cols = [
-    col for col in numeric_cols
-    if any(key in col.upper() for key in spending_keywords)
-]
-social_cols = [
-    col for col in numeric_cols
-    if any(key in col.upper() for key in social_keywords)
-]
-
-# Remove duplicate names while preserving their order.
-fiscal_cols = list(dict.fromkeys(fiscal_cols))
-spending_cols = list(dict.fromkeys(spending_cols))
-social_cols = list(dict.fromkeys(social_cols))
-
-# ============================================================
-# 5. SIDEBAR FILTERS
-# ============================================================
-
-st.sidebar.title("📊 FISCAL ANALYTICS")
-st.sidebar.caption("DATAAKSI | Regional Development")
-st.sidebar.markdown("---")
-st.sidebar.subheader("Filter Data")
-
-years = sorted(df["Tahun"].dropna().astype(int).unique().tolist())
-cities = sorted(df["Kota"].dropna().astype(str).unique().tolist())
-
-if not years or not cities:
-    st.error("Dataset tidak memiliki tahun atau wilayah yang valid.")
-    st.stop()
-
-selected_years = st.sidebar.multiselect(
-    "Pilih tahun", options=years, default=years
-)
-selected_cities = st.sidebar.multiselect(
-    "Pilih wilayah", options=cities, default=cities
-)
-
-if not selected_years or not selected_cities:
-    st.warning("Pilih minimal satu tahun dan satu wilayah.")
-    st.stop()
-
-filtered = df[
-    df["Tahun"].isin(selected_years) & df["Kota"].isin(selected_cities)
-].copy()
+# KPI
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Observasi", f"{len(filtered):,}")
+k2.metric("Variabel", f"{filtered.shape[1]:,}")
+k3.metric("Wilayah unik", f"{filtered[region_col].nunique():,}" if region_col and not filtered.empty else "Tidak terdeteksi")
+k4.metric("Tahun/periode", f"{filtered[year_col].nunique():,}" if year_col and not filtered.empty else "Tidak terdeteksi")
 
 if filtered.empty:
-    st.warning("Tidak ada observasi untuk filter tersebut.")
+    st.warning("Filter tidak menghasilkan observasi. Pilih minimal satu wilayah dan periksa rentang tahun.")
     st.stop()
 
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    f"Dataset: {len(df):,} observasi | {len(numeric_cols)} indikator numerik"
-)
-if st.sidebar.button("🔄 Refresh dataset"):
-    load_data_from_url.clear()
-    st.rerun()
-
-# ============================================================
-# 6. HEADER AND KPI CARDS
-# ============================================================
-
-st.title("Fiscal & Regional Development Analytics")
-st.markdown(
-    "### Dashboard Analisis Fiskal, Belanja Modal, dan Kinerja Pembangunan Daerah"
-)
-st.caption(
-    "Sumber: DATAAKSI — dataset_fiskal_97_hipoFull.csv. "
-    "Interpretasi indikator mengikuti definisi dan satuan data sumber."
-)
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Observasi", f"{len(filtered):,}")
-c2.metric("Wilayah", f"{filtered['Kota'].nunique():,}")
-c3.metric(
-    "Rentang Tahun",
-    f"{int(filtered['Tahun'].min())}–{int(filtered['Tahun'].max())}",
-)
-c4.metric("Indikator Numerik", f"{len(numeric_cols):,}")
-st.markdown("---")
-
 tabs = st.tabs([
-    "OVERVIEW", "FISCAL", "EXPENDITURE", "DEVELOPMENT",
-    "VISUALIZATION", "CORRELATION", "OLS REGRESSION",
-    "DIAGNOSTICS", "DATA & EXPORT",
+    "Overview",
+    "Fiscal Analytics",
+    "Regional Comparison",
+    "Visualization",
+    "Correlation",
+    "OLS Regression",
+    "Diagnostics",
+    "Data & Export",
 ])
 
 # ============================================================
 # TAB 1: OVERVIEW
 # ============================================================
-
 with tabs[0]:
-    st.subheader("Dataset Overview")
-    left, right = st.columns(2)
-
+    st.subheader("Ringkasan dataset")
+    left, right = st.columns([1.2, 1])
     with left:
-        year_counts = (
-            filtered.groupby("Tahun").size().reset_index(name="Jumlah Observasi")
-        )
-        fig = px.bar(
-            year_counts, x="Tahun", y="Jumlah Observasi",
-            text="Jumlah Observasi", title="Distribusi Observasi Tahunan",
-        )
-        fig.update_layout(template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-
+        st.write("**Cuplikan data**")
+        st.dataframe(filtered.head(20), use_container_width=True)
     with right:
-        st.markdown("**Statistik deskriptif**")
+        st.write("**Kualitas data**")
+        quality = pd.DataFrame({
+            "Kolom": filtered.columns,
+            "Tipe data": [str(filtered[c].dtype) for c in filtered.columns],
+            "Missing": [int(filtered[c].isna().sum()) for c in filtered.columns],
+            "Missing (%)": [round(filtered[c].isna().mean() * 100, 2) for c in filtered.columns],
+            "Nilai unik": [int(filtered[c].nunique(dropna=True)) for c in filtered.columns],
+        })
+        st.dataframe(quality, use_container_width=True, hide_index=True)
+    if numeric_cols:
+        st.write("**Statistik deskriptif variabel numerik**")
         st.dataframe(filtered[numeric_cols].describe().T, use_container_width=True)
 
-    st.subheader("Kelengkapan Data")
-    missing = filtered.isna().sum().rename("Missing").reset_index()
-    missing.columns = ["Variabel", "Missing"]
-    missing["Persentase Missing (%)"] = (
-        missing["Missing"] / max(len(filtered), 1) * 100
-    ).round(2)
-    st.dataframe(missing, use_container_width=True)
-
-    st.subheader("Rata-rata Indikator per Tahun")
-    chosen_overview = st.selectbox(
-        "Indikator", numeric_cols, key="overview_indicator"
-    )
-    annual = filtered.groupby("Tahun", as_index=False)[chosen_overview].mean()
-    fig = px.line(
-        annual, x="Tahun", y=chosen_overview, markers=True,
-        title=f"Tren Tahunan: {chosen_overview}",
-    )
-    fig.update_layout(template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
-
 # ============================================================
-# TAB 2: FISCAL ANALYSIS
+# TAB 2: FISCAL ANALYTICS
 # ============================================================
-
 with tabs[1]:
-    st.subheader("Fiscal Capacity & Revenue")
-    available_fiscal = fiscal_cols or numeric_cols
-    fiscal_indicator = st.selectbox(
-        "Pilih indikator fiskal", available_fiscal, key="fiscal_indicator"
-    )
-
-    city_annual = (
-        filtered.groupby(["Tahun", "Kota"], as_index=False)[fiscal_indicator].mean()
-    )
-    fig = px.line(
-        city_annual, x="Tahun", y=fiscal_indicator, color="Kota",
-        markers=True, title=f"Tren {fiscal_indicator} antarwilayah",
-    )
-    fig.update_layout(template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Perbandingan Fiskal Antarwilayah")
-    ranking_year = st.selectbox(
-        "Tahun untuk ranking",
-        sorted(filtered["Tahun"].unique().tolist()),
-        key="fiscal_rank_year",
-    )
-    rank_df = (
-        filtered.loc[filtered["Tahun"] == ranking_year]
-        .groupby("Kota", as_index=False)[fiscal_indicator].mean()
-        .sort_values(fiscal_indicator, ascending=False)
-    )
-    fig = px.bar(
-        rank_df, x=fiscal_indicator, y="Kota", orientation="h",
-        title=f"Ranking {fiscal_indicator} ({ranking_year})",
-    )
-    fig.update_layout(
-        template="plotly_white", yaxis={"categoryorder": "total ascending"}
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(
-        "Ranking berdasarkan nilai indikator; nilai yang lebih tinggi belum tentu "
-        "menunjukkan kualitas fiskal yang lebih baik."
-    )
-
-# ============================================================
-# TAB 3: EXPENDITURE ANALYSIS
-# ============================================================
-
-with tabs[2]:
-    st.subheader("Belanja Modal Sektoral")
-    available_spending = spending_cols or numeric_cols
-    expenditure_vars = st.multiselect(
-        "Pilih indikator belanja",
-        available_spending,
-        default=available_spending[:min(5, len(available_spending))],
-        key="expenditure_vars",
-    )
-
-    if expenditure_vars:
-        expenditure_annual = (
-            filtered.groupby("Tahun")[expenditure_vars].mean().reset_index()
-        )
-        expenditure_long = expenditure_annual.melt(
-            id_vars="Tahun", var_name="Indikator", value_name="Nilai"
-        )
-        fig = px.line(
-            expenditure_long, x="Tahun", y="Nilai", color="Indikator",
-            markers=True, title="Tren Belanja Modal Sektoral",
-        )
-        fig.update_layout(template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-
-        composition = (
-            filtered[expenditure_vars].mean().rename("Rata-rata").reset_index()
-        )
-        composition.columns = ["Sektor", "Rata-rata"]
-        fig = px.bar(
-            composition, x="Sektor", y="Rata-rata",
-            title="Rata-rata Nilai per Indikator Belanja",
-        )
-        fig.update_layout(template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-        st.info(
-            "Grafik membandingkan nilai rata-rata kolom. Pastikan satuan dan definisi "
-            "variabel sebanding sebelum menafsirkan komposisi."
-        )
-    else:
-        st.warning("Pilih setidaknya satu indikator.")
-
-# ============================================================
-# TAB 4: DEVELOPMENT INDICATORS
-# ============================================================
-
-with tabs[3]:
-    st.subheader("Regional Development Outcomes")
-    available_social = social_cols or numeric_cols
-    development_vars = st.multiselect(
-        "Pilih indikator pembangunan",
-        available_social,
-        default=available_social[:min(4, len(available_social))],
-        key="development_vars",
-    )
-
-    if development_vars:
-        development_long = filtered.melt(
-            id_vars=["Kota", "Tahun"], value_vars=development_vars,
-            var_name="Indikator", value_name="Nilai",
-        )
-        fig = px.line(
-            development_long, x="Tahun", y="Nilai", color="Kota",
-            facet_col="Indikator", facet_col_wrap=2, markers=True,
-            title="Tren Indikator Pembangunan",
-        )
-        fig.update_layout(template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-
-        dev_rank_indicator = st.selectbox(
-            "Indikator ranking", development_vars, key="dev_rank_indicator"
-        )
-        dev_rank_year = st.selectbox(
-            "Tahun ranking", sorted(filtered["Tahun"].unique().tolist()),
-            key="dev_rank_year",
-        )
-        dev_rank = (
-            filtered.loc[filtered["Tahun"] == dev_rank_year]
-            .groupby("Kota", as_index=False)[dev_rank_indicator].mean()
-            .sort_values(dev_rank_indicator, ascending=False)
-        )
-        fig = px.bar(
-            dev_rank, x=dev_rank_indicator, y="Kota", orientation="h",
-            title=f"{dev_rank_indicator} — {dev_rank_year}",
-        )
-        fig.update_layout(
-            template="plotly_white", yaxis={"categoryorder": "total ascending"}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            "Kemiskinan dan pengangguran umumnya diharapkan lebih rendah, sedangkan "
-            "IPM umumnya diharapkan lebih tinggi. Perhatikan definisi indikator."
-        )
-    else:
-        st.info("Pilih minimal satu indikator pembangunan.")
-
-# ============================================================
-# TAB 5: GENERAL VISUALIZATION
-# ============================================================
-
-with tabs[4]:
-    st.subheader("Interactive Visualization Lab")
-    chart_type = st.selectbox(
-        "Jenis grafik",
-        ["Line Chart", "Bar Chart", "Scatter Plot", "Histogram", "Box Plot"],
-    )
-    x_var = st.selectbox("Variabel X", numeric_cols, key="general_x")
-    y_var = st.selectbox(
-        "Variabel Y", numeric_cols,
-        index=min(1, len(numeric_cols) - 1), key="general_y",
-    )
-    color_options = ["Tidak ada"] + ["Kota", "Tahun"]
-    color_var = st.selectbox("Warna / kelompok", color_options)
-    color_arg = None if color_var == "Tidak ada" else color_var
-
-    if chart_type == "Line Chart":
-        fig = px.line(
-            filtered.sort_values("Tahun"), x="Tahun", y=y_var,
-            color=color_arg, markers=True,
-        )
-    elif chart_type == "Bar Chart":
-        group_var = color_arg if color_arg else "Tahun"
-        bar_data = filtered.groupby(group_var, as_index=False)[y_var].mean()
-        fig = px.bar(bar_data, x=group_var, y=y_var)
-    elif chart_type == "Scatter Plot":
-        scatter_data = filtered.dropna(subset=[x_var, y_var]).copy()
-        if scatter_data[x_var].nunique() >= 2 and scatter_data[y_var].nunique() >= 2:
-            fig = px.scatter(
-                scatter_data, x=x_var, y=y_var, color=color_arg,
-                hover_data=["Kota", "Tahun"], trendline="ols",
-            )
-        else:
-            fig = px.scatter(
-                scatter_data, x=x_var, y=y_var, color=color_arg,
-                hover_data=["Kota", "Tahun"],
-            )
-            st.info("Garis tren tidak ditampilkan karena variabel tidak cukup bervariasi.")
-    elif chart_type == "Histogram":
-        fig = px.histogram(filtered, x=x_var, color=color_arg, marginal="box")
-    else:
-        fig = px.box(filtered, x=color_arg, y=y_var, points="all")
-
-    fig.update_layout(template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
-
-# ============================================================
-# TAB 6: CORRELATION ANALYSIS
-# ============================================================
-
-with tabs[5]:
-    st.subheader("Correlation Matrix")
-    corr_vars = st.multiselect(
-        "Pilih variabel untuk korelasi", numeric_cols,
-        default=numeric_cols[:min(10, len(numeric_cols))], key="corr_vars",
-    )
-    corr_method = st.radio(
-        "Metode korelasi", ["pearson", "spearman", "kendall"], horizontal=True
-    )
-
-    if len(corr_vars) >= 2:
-        corr = filtered[corr_vars].corr(method=corr_method)
-        fig = px.imshow(
-            corr, text_auto=".2f", color_continuous_scale="RdBu_r",
-            zmin=-1, zmax=1, aspect="auto",
-            title=f"Correlation Matrix — {corr_method.title()}",
-        )
-        fig.update_layout(template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-
-        target_corr = st.selectbox(
-            "Target korelasi", corr_vars, key="target_corr"
-        )
-        corr_target = (
-            corr[target_corr].drop(labels=[target_corr], errors="ignore")
-            .dropna().sort_values().reset_index()
-        )
-        corr_target.columns = ["Variabel", "Korelasi"]
-        fig = px.bar(
-            corr_target, x="Korelasi", y="Variabel", orientation="h",
-            color="Korelasi", color_continuous_scale="RdBu_r",
-            range_color=[-1, 1],
-        )
-        fig.update_layout(template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            "Korelasi menunjukkan asosiasi, bukan bukti kausalitas. Periksa struktur "
-            "panel, tren, dan faktor perancu sebelum membuat kesimpulan."
-        )
-    else:
-        st.info("Pilih minimal dua variabel numerik.")
-
-# ============================================================
-# TAB 7: OLS REGRESSION
-# ============================================================
-
-with tabs[6]:
-    st.subheader("Exploratory OLS Regression")
-    st.warning(
-        "OLS ini bersifat eksploratif. Untuk data panel, pertimbangkan struktur "
-        "panel, heterogenitas wilayah, autokorelasi, dan endogenitas."
-    )
-
-    default_target = "IPM" if "IPM" in numeric_cols else numeric_cols[0]
-    target = st.selectbox(
-        "Dependent variable (Y)", numeric_cols,
-        index=numeric_cols.index(default_target), key="ols_target",
-    )
-    predictor_options = [col for col in numeric_cols if col != target]
-    default_predictors = [
-        col for col in ["PAD", "ICT", "bm_pendidikan", "bm_kesehatan", "DAU_Grant"]
-        if col in predictor_options
+    st.subheader("Analisis fiskal")
+    fiscal_keywords = [
+        "pad", "pendapatan", "transfer", "belanja", "pajak", "retribusi",
+        "dau", "dak", "dbhp", "dbH", "silpa", "apbd", "fiskal", "penerimaan",
+        "bm_pendidikan", "bm_kesehatan", "bm_infrastruktur"
     ]
-    predictors = st.multiselect(
-        "Independent variables (X)", predictor_options,
-        default=default_predictors, key="ols_predictors",
-    )
-    add_city_fe = st.checkbox("Tambahkan dummy fixed effect Kota", value=False)
-    add_year_fe = st.checkbox("Tambahkan dummy fixed effect Tahun", value=False)
-    use_hc3 = st.checkbox("Gunakan standard errors HC3", value=True)
-
-    if st.button("🚀 Estimate OLS Model", type="primary"):
-        if not predictors:
-            st.error("Pilih minimal satu variabel independen.")
-        else:
-            model_cols = list(dict.fromkeys([target, *predictors, "Kota", "Tahun"]))
-            model_df = filtered[model_cols].replace([np.inf, -np.inf], np.nan).dropna().copy()
-
-            if len(model_df) < 3:
-                st.error("Observasi valid terlalu sedikit untuk estimasi.")
-            else:
-                X = model_df[predictors].astype(float).copy()
-                y = model_df[target].astype(float).copy()
-
-                if add_city_fe:
-                    city_dummies = pd.get_dummies(
-                        model_df["Kota"], prefix="Kota", drop_first=True, dtype=float
-                    )
-                    X = pd.concat(
-                        [X.reset_index(drop=True), city_dummies.reset_index(drop=True)],
-                        axis=1,
-                    )
-                if add_year_fe:
-                    year_dummies = pd.get_dummies(
-                        model_df["Tahun"].astype(str), prefix="Tahun",
-                        drop_first=True, dtype=float,
-                    )
-                    X = pd.concat(
-                        [X.reset_index(drop=True), year_dummies.reset_index(drop=True)],
-                        axis=1,
-                    )
-
-                X = X.loc[:, X.nunique(dropna=False) > 1]
-                X = sm.add_constant(X, has_constant="add")
-
-                if len(model_df) <= X.shape[1]:
-                    st.error(
-                        "Observasi tidak cukup dibanding jumlah parameter. "
-                        "Kurangi prediktor atau nonaktifkan sebagian fixed effects."
-                    )
-                elif np.linalg.matrix_rank(X.to_numpy()) < X.shape[1]:
-                    st.error(
-                        "Matriks prediktor mengalami multikolinearitas sempurna. "
-                        "Kurangi variabel atau dummy yang redundan."
-                    )
-                else:
-                    try:
-                        model = sm.OLS(y.reset_index(drop=True), X.reset_index(drop=True)).fit(
-                            cov_type="HC3" if use_hc3 else "nonrobust"
-                        )
-                        st.session_state["ols_model"] = model
-                        st.session_state["ols_X"] = X
-                        st.session_state["ols_y"] = y.reset_index(drop=True)
-                        st.session_state["ols_df"] = model_df.reset_index(drop=True)
-                        st.session_state["ols_target_name"] = target
-                    except Exception as error:
-                        st.error(f"Estimasi gagal: {error}")
-
-    if "ols_model" in st.session_state:
-        model = st.session_state["ols_model"]
-        if model.nobs > 0:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Observations", f"{int(model.nobs):,}")
-            m2.metric("R-squared", f"{model.rsquared:.4f}")
-            m3.metric("Adjusted R²", f"{model.rsquared_adj:.4f}")
-            m4.metric("Prob (F-statistic)", f"{model.f_pvalue:.4g}")
-
-            st.subheader("Regression Coefficients")
-            conf_int = model.conf_int()
-            coef_df = pd.DataFrame({
-                "Variable": model.params.index,
-                "Coefficient": model.params.values,
-                "Std. Error": model.bse.values,
-                "t-statistic": model.tvalues.values,
-                "p-value": model.pvalues.values,
-                "CI Lower": conf_int.iloc[:, 0].values,
-                "CI Upper": conf_int.iloc[:, 1].values,
-            })
-            st.dataframe(coef_df.round(5), use_container_width=True)
-
-            coef_plot = coef_df[coef_df["Variable"] != "const"].copy()
-            if not coef_plot.empty:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=coef_plot["Coefficient"], y=coef_plot["Variable"],
-                    mode="markers",
-                    error_x=dict(
-                        type="data", symmetric=False,
-                        array=(coef_plot["CI Upper"] - coef_plot["Coefficient"]),
-                        arrayminus=(coef_plot["Coefficient"] - coef_plot["CI Lower"]),
-                    ),
-                ))
-                fig.add_vline(x=0, line_dash="dash")
-                fig.update_layout(
-                    title="Coefficient Plot with 95% Confidence Intervals",
-                    xaxis_title="Coefficient", yaxis_title="Variable",
-                    template="plotly_white",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            st.subheader("Full OLS Summary")
-            st.code(model.summary().as_text())
-            st.download_button(
-                "⬇️ Download Coefficients CSV",
-                coef_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name="ols_coefficients.csv", mime="text/csv",
-            )
-
-# ============================================================
-# TAB 8: REGRESSION DIAGNOSTICS
-# ============================================================
-
-with tabs[7]:
-    st.subheader("OLS Diagnostics")
-    if "ols_model" not in st.session_state:
-        st.info("Estimasi model terlebih dahulu pada tab OLS REGRESSION.")
-    else:
-        model = st.session_state["ols_model"]
-        residuals = np.asarray(model.resid, dtype=float)
-        fitted = np.asarray(model.fittedvalues, dtype=float)
-        exog = np.asarray(model.model.exog, dtype=float)
-
-        left, right = st.columns(2)
-        with left:
-            fig = px.scatter(
-                x=fitted, y=residuals,
-                labels={"x": "Fitted Values", "y": "Residuals"},
-                title="Residuals vs Fitted",
-            )
-            fig.add_hline(y=0, line_dash="dash")
-            fig.update_layout(template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
-
-        with right:
-            qq = sm.ProbPlot(residuals)
-            theoretical = qq.theoretical_quantiles
-            ordered_residuals = np.sort(residuals)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=theoretical, y=ordered_residuals,
-                mode="markers", name="Residuals",
-            ))
-            q1, q3 = np.percentile(ordered_residuals, [25, 75])
-            t1, t3 = np.percentile(theoretical, [25, 75])
-            if not np.isclose(t3, t1):
-                slope = (q3 - q1) / (t3 - t1)
-                intercept = q1 - slope * t1
-                fig.add_trace(go.Scatter(
-                    x=theoretical, y=intercept + slope * theoretical,
-                    mode="lines", name="Reference line",
-                ))
-            fig.update_layout(
-                title="Q-Q Plot", xaxis_title="Theoretical Quantiles",
-                yaxis_title="Ordered Residuals", template="plotly_white",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        diag_results = []
-        n_obs, n_params = exog.shape
-
-        if n_obs > n_params and n_params >= 2:
-            try:
-                bp = het_breuschpagan(residuals, exog)
-                diag_results.append({
-                    "Test": "Breusch-Pagan", "Statistic": bp[0], "p-value": bp[1],
-                    "Interpretation": (
-                        "Indikasi heteroskedastisitas" if bp[1] < 0.05
-                        else "Tidak menolak homoskedastisitas"
-                    ),
-                })
-            except Exception as error:
-                diag_results.append({
-                    "Test": "Breusch-Pagan", "Statistic": np.nan,
-                    "p-value": np.nan, "Interpretation": f"Tidak dapat dihitung: {error}",
-                })
-
-            try:
-                white = het_white(residuals, exog)
-                diag_results.append({
-                    "Test": "White", "Statistic": white[0], "p-value": white[1],
-                    "Interpretation": (
-                        "Indikasi heteroskedastisitas" if white[1] < 0.05
-                        else "Tidak menolak homoskedastisitas"
-                    ),
-                })
-            except Exception as error:
-                diag_results.append({
-                    "Test": "White", "Statistic": np.nan,
-                    "p-value": np.nan, "Interpretation": f"Tidak dapat dihitung: {error}",
-                })
-        else:
-            st.info(
-                "Breusch-Pagan dan White tidak dijalankan karena jumlah observasi "
-                "tidak memadai dibanding jumlah parameter."
-            )
-
-        try:
-            jb_stat, jb_p, skewness, kurtosis = jarque_bera(residuals)
-            diag_results.append({
-                "Test": "Jarque-Bera", "Statistic": jb_stat, "p-value": jb_p,
-                "Interpretation": (
-                    "Residual tidak normal menurut uji" if jb_p < 0.05
-                    else "Tidak menolak normalitas residual"
-                ),
-            })
-        except Exception as error:
-            diag_results.append({
-                "Test": "Jarque-Bera", "Statistic": np.nan, "p-value": np.nan,
-                "Interpretation": f"Tidak dapat dihitung: {error}",
-            })
-
-        try:
-            dw = durbin_watson(residuals)
-            diag_results.append({
-                "Test": "Durbin-Watson", "Statistic": dw, "p-value": np.nan,
-                "Interpretation": (
-                    "Nilai sekitar 2 sering menjadi indikasi awal tidak adanya "
-                    "autokorelasi orde pertama; bukan uji lengkap untuk data panel."
-                ),
-            })
-        except Exception as error:
-            diag_results.append({
-                "Test": "Durbin-Watson", "Statistic": np.nan, "p-value": np.nan,
-                "Interpretation": f"Tidak dapat dihitung: {error}",
-            })
-
-        if diag_results:
-            st.subheader("Diagnostic Test Results")
-            st.dataframe(pd.DataFrame(diag_results).round(5), use_container_width=True)
-
-        st.caption(
-            "Interpretasikan uji sesuai asumsi dan struktur data. HC3 tidak sama "
-            "dengan standard errors yang dikelompokkan menurut wilayah; Durbin-Watson "
-            "juga bukan uji lengkap autokorelasi panel."
+    suggested = [
+        c for c in numeric_cols
+        if any(normalize_name(k) in normalize_name(c) for k in fiscal_keywords)
+    ]
+    default_metric = suggested[0] if suggested else (numeric_cols[0] if numeric_cols else None)
+    if numeric_cols:
+        metric = st.selectbox(
+            "Pilih indikator fiskal/numerik",
+            numeric_cols,
+            index=numeric_cols.index(default_metric),
         )
+        a, b = st.columns(2)
+        with a:
+            st.metric(f"Rata-rata {metric}", f"{filtered[metric].mean():,.3f}" if filtered[metric].notna().any() else "NA")
+            fig = px.histogram(filtered, x=metric, nbins=30, title=f"Distribusi {metric}")
+            st.plotly_chart(fig, use_container_width=True)
+        with b:
+            st.metric(f"Median {metric}", f"{filtered[metric].median():,.3f}" if filtered[metric].notna().any() else "NA")
+            if region_col:
+                agg = filtered.groupby(region_col, dropna=False)[metric].mean().reset_index().sort_values(metric, ascending=False)
+                fig = px.bar(agg, x=region_col, y=metric, title=f"Rata-rata {metric} per wilayah")
+                fig.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Kolom wilayah tidak terdeteksi; grafik per wilayah dilewati.")
+    else:
+        st.warning("Tidak ditemukan kolom numerik. Periksa format data CSV.")
 
 # ============================================================
-# TAB 9: DATA TABLE & EXPORT
+# TAB 3: REGIONAL COMPARISON
 # ============================================================
+with tabs[2]:
+    st.subheader("Perbandingan wilayah")
+    if region_col and numeric_cols:
+        comp_metric = st.selectbox("Indikator untuk dibandingkan", numeric_cols, key="comp_metric")
+        agg = filtered.groupby(region_col, dropna=False)[comp_metric].agg(["mean", "median", "sum", "count"]).reset_index()
+        agg.columns = [region_col, "Rata-rata", "Median", "Total", "Jumlah observasi"]
+        st.dataframe(agg.sort_values("Rata-rata", ascending=False), use_container_width=True, hide_index=True)
+        fig = px.bar(agg.sort_values("Rata-rata", ascending=False), x=region_col, y="Rata-rata",
+                     hover_data=["Median", "Total", "Jumlah observasi"],
+                     title=f"Perbandingan rata-rata {comp_metric}")
+        fig.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Perbandingan wilayah membutuhkan kolom wilayah dan setidaknya satu kolom numerik.")
 
-with tabs[8]:
-    st.subheader("Filtered Dataset")
-    search_city = st.text_input(
-        "Cari nama wilayah", placeholder="Contoh: Kota Makassar"
-    )
-    export_df = filtered.copy()
-    if search_city:
-        export_df = export_df[
-            export_df["Kota"].str.contains(search_city, case=False, na=False)
-        ]
+# ============================================================
+# TAB 4: VISUALIZATION
+# ============================================================
+with tabs[3]:
+    st.subheader("Visualisasi interaktif")
+    if numeric_cols:
+        chart_type = st.radio("Jenis grafik", ["Tren garis", "Scatter plot", "Box plot"], horizontal=True)
+        x_options = df.columns.tolist()
+        if chart_type == "Tren garis":
+            x_default = year_col if year_col else (categorical_cols[0] if categorical_cols else df.columns[0])
+            x_col = st.selectbox("Sumbu X", x_options, index=x_options.index(x_default), key="line_x")
+            y_col = st.selectbox("Sumbu Y", numeric_cols, key="line_y")
+            plot_df = filtered.groupby(x_col, dropna=False)[y_col].mean().reset_index() if x_col in categorical_cols or x_col == year_col else filtered
+            fig = px.line(plot_df, x=x_col, y=y_col, markers=True, title=f"{y_col} menurut {x_col}")
+        elif chart_type == "Scatter plot":
+            x_col = st.selectbox("Variabel X", numeric_cols, key="scatter_x")
+            y_col = st.selectbox("Variabel Y", [c for c in numeric_cols if c != x_col] or numeric_cols, key="scatter_y")
+            color_col = st.selectbox("Warna (opsional)", ["Tidak ada"] + categorical_cols, key="scatter_color")
+            fig = px.scatter(filtered, x=x_col, y=y_col,
+                             color=None if color_col == "Tidak ada" else color_col,
+                             hover_name=region_col if region_col else None,
+                             title=f"Hubungan {x_col} dan {y_col}")
+        else:
+            y_col = st.selectbox("Variabel untuk box plot", numeric_cols, key="box_y")
+            color_col = st.selectbox("Kelompok (opsional)", ["Tidak ada"] + categorical_cols, key="box_color")
+            fig = px.box(filtered, y=y_col, x=None if color_col == "Tidak ada" else color_col,
+                         title=f"Distribusi {y_col}")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Tidak ada kolom numerik untuk divisualisasikan.")
 
-    st.write(
-        f"Menampilkan {len(export_df):,} baris dan {len(export_df.columns):,} kolom."
-    )
-    st.dataframe(export_df, use_container_width=True, height=500)
+# ============================================================
+# TAB 5: CORRELATION
+# ============================================================
+with tabs[4]:
+    st.subheader("Matriks korelasi")
+    if len(numeric_cols) >= 2:
+        corr_cols = st.multiselect("Pilih variabel numerik", numeric_cols, default=numeric_cols[:min(12, len(numeric_cols))])
+        if len(corr_cols) >= 2:
+            corr = filtered[corr_cols].corr(numeric_only=True)
+            fig = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r",
+                            zmin=-1, zmax=1, title="Korelasi Pearson")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Korelasi menunjukkan asosiasi linear, bukan bukti hubungan sebab-akibat.")
+        else:
+            st.info("Pilih setidaknya dua variabel.")
+    else:
+        st.info("Korelasi membutuhkan minimal dua kolom numerik.")
 
-    csv_data = export_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "⬇️ Download Filtered Data (CSV)", data=csv_data,
-        file_name="dataset_fiskal_filtered.csv", mime="text/csv",
-    )
+# ============================================================
+# TAB 6: OLS REGRESSION
+# ============================================================
+with tabs[5]:
+    st.subheader("Regresi linear OLS")
+    st.caption("Gunakan variabel yang relevan secara teori. Hasil regresi tidak otomatis menunjukkan hubungan kausal.")
+    if len(numeric_cols) >= 2:
+        y_var = st.selectbox("Variabel dependen (Y)", numeric_cols, key="ols_y")
+        x_candidates = [c for c in numeric_cols if c != y_var]
+        x_vars = st.multiselect("Variabel independen (X)", x_candidates, default=x_candidates[:min(3, len(x_candidates))], key="ols_x")
+        if st.button("Estimasi model OLS", type="primary"):
+            if not x_vars:
+                st.error("Pilih minimal satu variabel independen.")
+            else:
+                model_df = filtered[[y_var] + x_vars].replace([np.inf, -np.inf], np.nan).dropna()
+                if len(model_df) <= len(x_vars) + 1:
+                    st.error("Observasi valid tidak cukup untuk mengestimasi model ini.")
+                else:
+                    X = sm.add_constant(model_df[x_vars], has_constant="add")
+                    y = model_df[y_var]
+                    try:
+                        model = sm.OLS(y, X).fit()
+                        st.write(f"Observasi model: **{int(model.nobs)}**")
+                        st.text(model.summary().as_text())
+                        coef = pd.DataFrame({
+                            "Variabel": model.params.index,
+                            "Koefisien": model.params.values,
+                            "Std. Error": model.bse.values,
+                            "p-value": model.pvalues.values,
+                            "CI bawah": model.conf_int()[0].values,
+                            "CI atas": model.conf_int()[1].values,
+                        })
+                        st.dataframe(coef, use_container_width=True, hide_index=True)
+                        pred_df = pd.DataFrame({"Aktual": y, "Prediksi": model.predict(X)})
+                        fig = px.scatter(pred_df, x="Aktual", y="Prediksi", title="Nilai aktual vs prediksi")
+                        lo = min(pred_df.min().min(), pred_df.max().min())
+                        hi = max(pred_df.max().max(), pred_df.min().max())
+                        fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="Garis 45°"))
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.session_state["ols_model_summary"] = model.summary().as_text()
+                        st.session_state["ols_coef"] = coef
+                        st.session_state["ols_resid"] = model.resid
+                        st.session_state["ols_fitted"] = model.fittedvalues
+                    except Exception as e:
+                        st.error(f"Model gagal diestimasi: {e}")
+    else:
+        st.info("Regresi OLS membutuhkan minimal dua variabel numerik.")
 
+# ============================================================
+# TAB 7: DIAGNOSTICS
+# ============================================================
+with tabs[6]:
+    st.subheader("Diagnostik model")
+    if "ols_resid" not in st.session_state:
+        st.info("Estimasi model pada tab OLS Regression terlebih dahulu.")
+    else:
+        resid = pd.Series(st.session_state["ols_resid"]).dropna()
+        fitted = pd.Series(st.session_state["ols_fitted"]).loc[resid.index]
+        d1, d2, d3 = st.columns(3)
+        jb_stat, jb_p, skew, kurtosis = jarque_bera(resid)
+        d1.metric("Jarque–Bera p-value", f"{jb_p:.4f}")
+        d2.metric("Durbin–Watson", f"{durbin_watson(resid):.4f}")
+        fig = px.scatter(x=fitted, y=resid, labels={"x": "Fitted values", "y": "Residual"},
+                         title="Residual vs Fitted")
+        fig.add_hline(y=0, line_dash="dash")
+        st.plotly_chart(fig, use_container_width=True)
+        st.write("**Interpretasi ringkas**")
+        st.write("- Jarque–Bera: p-value kecil dapat mengindikasikan residual tidak normal.")
+        st.write("- Durbin–Watson mendekati 2 umumnya menunjukkan autokorelasi orde pertama yang lebih rendah; interpretasi bergantung pada struktur data.")
+        st.write("- Residual vs fitted membantu memeriksa pola varians dan bentuk hubungan.")
+        st.warning("Untuk Breusch–Pagan dan VIF, pilih kembali variabel model dan jalankan estimasi; interpretasi perlu mempertimbangkan jenis data dan spesifikasi model.")
+
+# ============================================================
+# TAB 8: DATA & EXPORT
+# ============================================================
+with tabs[7]:
+    st.subheader("Data terfilter")
+    st.write(f"Menampilkan **{len(filtered):,} baris** dari {len(df):,} baris awal.")
+    st.dataframe(filtered, use_container_width=True, height=480)
+    csv_data = filtered.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("⬇️ Unduh CSV", data=csv_data, file_name="dataset_fiskal_terfilter.csv", mime="text/csv")
     try:
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            export_df.to_excel(writer, sheet_name="Filtered Data", index=False)
-            export_df[numeric_cols].describe().T.to_excel(
-                writer, sheet_name="Descriptive Stats"
-            )
         st.download_button(
-            "⬇️ Download Excel Report", data=excel_buffer.getvalue(),
-            file_name="fiscal_analytics_report.xlsx",
+            "⬇️ Unduh Excel",
+            data=to_excel_bytes(filtered),
+            file_name="dataset_fiskal_terfilter.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    except Exception as error:
-        st.warning(f"Ekspor Excel gagal. Pastikan openpyxl terpasang. Detail: {error}")
+    except Exception as e:
+        st.warning(f"Ekspor Excel belum tersedia: {e}")
 
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown("---")
-st.caption(
-    "Fiscal & Regional Development Analytics | DATAAKSI | "
-    "Exploratory analysis — interpret results with care."
-)
+with st.expander("Nama kolom yang terdeteksi"):
+    st.write("**Kolom wilayah:**", region_col or "Tidak terdeteksi otomatis")
+    st.write("**Kolom tahun/periode:**", year_col or "Tidak terdeteksi otomatis")
+    st.write("**Semua kolom:**")
+    st.code(", ".join(map(str, df.columns)))
